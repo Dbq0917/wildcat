@@ -459,6 +459,11 @@ func (db *DB) Close() error {
 	return nil
 }
 
+type recoveredTxnKey struct {
+	id        int64
+	timestamp int64
+}
+
 // reinstate reopens the WAL files and replays them to restore the state of the database
 func (db *DB) reinstate() error {
 	db.log("Reinstating state...")
@@ -520,8 +525,10 @@ func (db *DB) reinstate() error {
 
 	db.log(fmt.Sprintf("Found %d WAL files, processing them...", len(walFiles)))
 
-	// Global transaction map to track transactions across all WAL files
-	txnTimeline := make(map[int64][]*Txn)
+	// Track each transaction instance separately. The transaction buffer slot ID
+	// is reused after a transaction is removed, so the ID alone cannot identify a
+	// transaction across WAL files.
+	txnTimeline := make(map[recoveredTxnKey][]*Txn)
 	var totalEntries int
 
 	// Process all WAL files in order (chronological)
@@ -594,68 +601,101 @@ func (db *DB) reinstate() error {
 			}
 
 			// Add to timeline in order
-			txnTimeline[txn.Id] = append(txnTimeline[txn.Id], txnCopy)
+			txnKey := recoveredTxnKey{id: txn.Id, timestamp: txn.Timestamp}
+			txnTimeline[txnKey] = append(txnTimeline[txnKey], txnCopy)
 		}
 
 		db.log(fmt.Sprintf("Processed %d entries from WAL %s", walEntries, walPath))
 	}
 
-	// Now consolidate the transaction timeline into the final transaction state
+	// Now consolidate the transaction timeline into the final transaction state.
+	// WAL entries contain full transaction snapshots, so the newest snapshot wins.
+	// An empty, uncommitted snapshot is a rollback and must discard earlier writes
+	// from that transaction instance.
 	globalTxnMap := make(map[int64]*Txn)
+	var globalTxnID int64
 
-	for txnID, txnEntries := range txnTimeline {
-		// Create an empty final transaction state
-		finalTxn := &Txn{
-			Id:        txnID,
-			WriteSet:  make(map[string][]byte),
-			DeleteSet: make(map[string]bool),
-			ReadSet:   make(map[string]int64),
-			Committed: false,
-			db:        db,
+	for txnKey, txnEntries := range txnTimeline {
+		var finalTxn *Txn
+
+		flushFinalTxn := func() {
+			if finalTxn == nil {
+				return
+			}
+
+			if len(finalTxn.WriteSet) == 0 && len(finalTxn.DeleteSet) == 0 &&
+				len(finalTxn.ReadSet) == 0 && !finalTxn.Committed {
+				finalTxn = nil
+				return
+			}
+
+			globalTxnMap[globalTxnID] = finalTxn
+			globalTxnID++
+			finalTxn = nil
 		}
 
-		// Apply transactions in chronological order
 		for _, entry := range txnEntries {
-			// Update final transaction timestamp to the latest
-			if entry.Timestamp > finalTxn.Timestamp {
-				finalTxn.Timestamp = entry.Timestamp
+			isEmpty := len(entry.WriteSet) == 0 && len(entry.DeleteSet) == 0 && len(entry.ReadSet) == 0
+
+			if isEmpty {
+				if entry.Committed {
+					// A commit record is authoritative even if it carries no sets.
+					if finalTxn == nil {
+						finalTxn = &Txn{
+							Id:        txnKey.id,
+							Timestamp: txnKey.timestamp,
+							WriteSet:  make(map[string][]byte),
+							DeleteSet: make(map[string]bool),
+							ReadSet:   make(map[string]int64),
+							db:        db,
+						}
+					}
+					finalTxn.Committed = true
+				} else if finalTxn != nil && !finalTxn.Committed {
+					// Rollback snapshot: discard the uncommitted writes accumulated
+					// before it. A rollback after a durable commit is a no-op.
+					finalTxn = nil
+				}
+				continue
 			}
 
-			// A commit flag on any entry means the transaction is committed
-			if entry.Committed {
-				finalTxn.Committed = true
+			if finalTxn == nil || finalTxn.Committed {
+				flushFinalTxn()
+				finalTxn = &Txn{
+					Id:        txnKey.id,
+					Timestamp: txnKey.timestamp,
+					WriteSet:  make(map[string][]byte),
+					DeleteSet: make(map[string]bool),
+					ReadSet:   make(map[string]int64),
+					db:        db,
+				}
 			}
 
-			// Process writes - newer operations override older ones
+			// Each entry is a full snapshot of the transaction at the time it was
+			// appended, so the newest snapshot replaces the previous one.
+			finalTxn.WriteSet = make(map[string][]byte, len(entry.WriteSet))
 			for key, value := range entry.WriteSet {
 				finalTxn.WriteSet[key] = value
-				// If it was previously deleted, remove it from delete set
-				delete(finalTxn.DeleteSet, key)
 			}
 
-			// Process deletes - delete always wins over write
+			finalTxn.DeleteSet = make(map[string]bool, len(entry.DeleteSet))
 			for key := range entry.DeleteSet {
-				delete(finalTxn.WriteSet, key) // Remove from write set
 				finalTxn.DeleteSet[key] = true
 			}
 
-			// Process reads - always keep the latest read timestamp
+			finalTxn.ReadSet = make(map[string]int64, len(entry.ReadSet))
 			for key, timestamp := range entry.ReadSet {
-				// Only update if this read is newer
-				if ts, exists := finalTxn.ReadSet[key]; !exists || timestamp > ts {
-					finalTxn.ReadSet[key] = timestamp
-				}
+				finalTxn.ReadSet[key] = timestamp
+			}
+
+			// A commit flag on any snapshot means the transaction is committed.
+			// This also handles commit records that contain no additional data.
+			if entry.Committed {
+				finalTxn.Committed = true
 			}
 		}
 
-		// Clean up any empty sets
-		if len(finalTxn.WriteSet) == 0 && len(finalTxn.DeleteSet) == 0 && len(finalTxn.ReadSet) == 0 && !finalTxn.Committed {
-			// Skip this transaction as it has no actual impact
-			continue
-		}
-
-		// Store the consolidated transaction
-		globalTxnMap[txnID] = finalTxn
+		flushFinalTxn()
 	}
 
 	// Create immutable memtables for all but the last WAL
@@ -674,7 +714,7 @@ func (db *DB) reinstate() error {
 
 		// For immutable memtables, include committed transactions
 		// This ensures that data is available for reading even before flushing completes
-		populateMemtableFromTxns(immutableMemt, globalTxnMap, db.opts.RecoverUncommittedTxns)
+		populateMemtableFromTxns(immutableMemt, globalTxnMap, false)
 
 		// Enqueue the memtable for flushing
 		db.flusher.immutable.Enqueue(immutableMemt)
@@ -711,62 +751,69 @@ func (db *DB) reinstate() error {
 	})
 
 	// Populate the active memtable with all committed transactions
-	populateMemtableFromTxns(activeMemt, globalTxnMap, db.opts.RecoverUncommittedTxns)
+	populateMemtableFromTxns(activeMemt, globalTxnMap, false)
 
 	// Store the active memtable
 	db.memtable.Store(activeMemt)
 
-	// Collect active (uncommitted) transactions and add to buffer
-	var activeCount int64
+	// Collect active (uncommitted) transactions for inspection when configured.
+	// They are never applied to a memtable, so they cannot become visible to
+	// normal reads before an explicit commit.
+	var uncommittedCount int64
 	for _, txn := range globalTxnMap {
-		if !txn.Committed &&
-			(len(txn.WriteSet) > 0 || len(txn.DeleteSet) > 0 || len(txn.ReadSet) > 0) {
+		if txn.Committed ||
+			(len(txn.WriteSet) == 0 && len(txn.DeleteSet) == 0 && len(txn.ReadSet) == 0) {
+			continue
+		}
+		uncommittedCount++
 
-			// Create a deep copy to avoid mutation issues
-			txnCopy := &Txn{
-				Id:        txn.Id,
-				Timestamp: txn.Timestamp,
-				WriteSet:  make(map[string][]byte),
-				DeleteSet: make(map[string]bool),
-				ReadSet:   make(map[string]int64),
-				Committed: txn.Committed,
-				db:        db,
-				mutex:     sync.Mutex{},
-			}
+		if !db.opts.RecoverUncommittedTxns {
+			continue
+		}
 
-			// Copy the sets
-			for k, v := range txn.WriteSet {
-				txnCopy.WriteSet[k] = v
-			}
-			for k := range txn.DeleteSet {
-				txnCopy.DeleteSet[k] = true
-			}
-			for k, v := range txn.ReadSet {
-				txnCopy.ReadSet[k] = v
-			}
+		// Create a deep copy to avoid mutation issues
+		txnCopy := &Txn{
+			Id:        txn.Id,
+			Timestamp: txn.Timestamp,
+			WriteSet:  make(map[string][]byte),
+			DeleteSet: make(map[string]bool),
+			ReadSet:   make(map[string]int64),
+			Committed: txn.Committed,
+			db:        db,
+			mutex:     sync.Mutex{},
+		}
 
-			txnCopy.Id, err = db.txnBuffer.Add(txnCopy)
-			if err != nil {
-				db.log(fmt.Sprintf("Warning: Failed to add transaction %d to buffer during recovery - buffer full", txn.Id))
-			} else {
-				activeCount++
-			}
+		// Copy the sets
+		for k, v := range txn.WriteSet {
+			txnCopy.WriteSet[k] = v
+		}
+		for k := range txn.DeleteSet {
+			txnCopy.DeleteSet[k] = true
+		}
+		for k, v := range txn.ReadSet {
+			txnCopy.ReadSet[k] = v
+		}
+
+		txnCopy.Id, err = db.txnBuffer.Add(txnCopy)
+		if err != nil {
+			db.log(fmt.Sprintf("Warning: Failed to add transaction %d to buffer during recovery - buffer full", txn.Id))
 		}
 	}
 
-	committedCount := int64(len(globalTxnMap)) - activeCount
+	committedCount := int64(len(globalTxnMap)) - uncommittedCount
 	db.log(fmt.Sprintf("Reinstatement completed: processed %d total entries across %d WAL files",
 		totalEntries, len(walFiles)))
-	db.log(fmt.Sprintf("Recovered %d transactions total, %d committed, %d active",
-		len(globalTxnMap), committedCount, activeCount))
+	db.log(fmt.Sprintf("Recovered %d transactions total, %d committed, %d uncommitted",
+		len(globalTxnMap), committedCount, uncommittedCount))
 	db.log(fmt.Sprintf("Active memtable size: %d bytes with %d entries",
 		atomic.LoadInt64(&activeMemt.size), activeMemt.skiplist.Count(time.Now().UnixNano()+FarFutureOffsetNs)))
 
 	return nil
 }
 
-// populateMemtableFromTxns helper function to populate a memtable from a transaction map
-func populateMemtableFromTxns(memt *Memtable, txnMap map[int64]*Txn, includeUncommitted bool) {
+// populateMemtableFromTxns helper function to populate a memtable from a transaction map.
+// Only committed transactions may become visible through normal reads.
+func populateMemtableFromTxns(memt *Memtable, txnMap map[int64]*Txn, _ bool) {
 	var committedCount, uncommittedCount int
 	var totalBytes int64
 
@@ -797,22 +844,11 @@ func populateMemtableFromTxns(memt *Memtable, txnMap map[int64]*Txn, includeUnco
 	for _, t := range txnSlice {
 		txn := t.txn
 
-		// For immutable memtables, we should include ALL committed transactions
-		// For active memtables, we include committed transactions but not uncommitted ones
-		shouldInclude := false
-		if txn.Committed {
-			shouldInclude = true
-			committedCount++
-		} else if includeUncommitted {
-			shouldInclude = true
+		if !txn.Committed {
 			uncommittedCount++
-		} else {
-			uncommittedCount++
-		}
-
-		if !shouldInclude {
 			continue
 		}
+		committedCount++
 
 		// Process all keys in this transaction
 		// Writes first
