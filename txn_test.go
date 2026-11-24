@@ -1082,6 +1082,113 @@ func TestTxn_ViewErrorHandling(t *testing.T) {
 	}
 }
 
+func TestDB_ViewAtHistoricalVersion(t *testing.T) {
+	dir, err := os.MkdirTemp("", "db_view_at_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer func(path string) {
+		_ = os.RemoveAll(path)
+	}(dir)
+
+	opts := &Options{
+		Directory:  dir,
+		SyncOption: SyncNone,
+	}
+
+	db, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func(db *DB) {
+		_ = db.Close()
+	}(db)
+
+	key := []byte("service_status")
+	values := [][]byte{[]byte("starting"), []byte("ready"), []byte("stopped")}
+	timestamps := make([]int64, len(values))
+
+	for i, value := range values {
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatalf("Failed to begin transaction %d: %v", i+1, err)
+		}
+
+		timestamps[i] = txn.Timestamp
+		if err := txn.Put(key, value); err != nil {
+			t.Fatalf("Failed to write version %d: %v", i+1, err)
+		}
+		if err := txn.Commit(); err != nil {
+			t.Fatalf("Failed to commit version %d: %v", i+1, err)
+		}
+	}
+
+	value, err := db.GetAt(key, timestamps[1])
+	if err != nil {
+		t.Fatalf("Failed to read middle version: %v", err)
+	}
+	if !bytes.Equal(value, values[1]) {
+		t.Errorf("Expected middle value %q, got %q", values[1], value)
+	}
+
+	err = db.ViewAt(timestamps[1], func(txn *Txn) error {
+		value, err := txn.Get(key)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(value, values[1]) {
+			t.Errorf("Expected middle value %q in ViewAt, got %q", values[1], value)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ViewAt failed: %v", err)
+	}
+
+	value, err = db.GetAtTime(key, time.Unix(0, timestamps[1]))
+	if err != nil {
+		t.Fatalf("Failed to read middle version with GetAtTime: %v", err)
+	}
+	if !bytes.Equal(value, values[1]) {
+		t.Errorf("Expected middle value %q with GetAtTime, got %q", values[1], value)
+	}
+
+	value, err = db.GetAt(key, timestamps[0])
+	if err != nil {
+		t.Fatalf("Failed to read first version: %v", err)
+	}
+	if !bytes.Equal(value, values[0]) {
+		t.Errorf("Expected first value %q, got %q", values[0], value)
+	}
+
+	value, err = db.GetAt(key, time.Now().UnixNano())
+	if err != nil {
+		t.Fatalf("Failed to read latest version: %v", err)
+	}
+	if !bytes.Equal(value, values[2]) {
+		t.Errorf("Expected latest value %q, got %q", values[2], value)
+	}
+
+	err = db.View(func(txn *Txn) error {
+		value, err := txn.Get(key)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(value, values[2]) {
+			t.Errorf("Expected regular View to read latest value %q, got %q", values[2], value)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("View failed: %v", err)
+	}
+
+	_, err = db.GetAt(key, timestamps[0]-1)
+	if err == nil {
+		t.Error("Expected key to be unavailable before its first version")
+	}
+}
+
 func TestTxn_ConcurrentCleanup(t *testing.T) {
 	dir, err := os.MkdirTemp("", "db_cleanup_test")
 	if err != nil {

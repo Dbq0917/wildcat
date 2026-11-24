@@ -43,6 +43,7 @@ Join our Discord community to discuss development, design, ask questions, and ge
   - [Simple Key-Value Operations](#simple-key-value-operations)
   - [Manual Transaction Management](#manual-transaction-management)
   - [Read-Only Transactions with View](#read-only-transactions-with-view)
+  - [Point-in-Time Reads](#point-in-time-reads)
   - [Batch Operations](#batch-operations)
   - [Iterating Keys](#iterating-keys)
     - [Full Iterator (bidirectional)](#full-iterator-bidirectional)
@@ -193,6 +194,27 @@ err = db.View(func(txn *wildcat.Txn) error {
     var err error
     result, err = txn.Get([]byte("hello"))
     return err
+})
+```
+
+### Point-in-Time Reads
+Use `ViewAt` to read the database state at a historical timestamp, or `GetAt` to
+read a single key. Timestamps use Unix nanoseconds and the boundary is inclusive.
+`ViewAtTime` and `GetAtTime` accept a `time.Time` when working with wall-clock times.
+
+```go
+value, err := db.GetAt([]byte("hello"), timestamp)
+if err != nil {
+    // Handle error
+}
+
+err = db.ViewAt(timestamp, func(txn *wildcat.Txn) error {
+    result, err := txn.Get([]byte("hello"))
+    if err != nil {
+        return err
+    }
+    fmt.Println("Historical value:", string(result))
+    return nil
 })
 ```
 

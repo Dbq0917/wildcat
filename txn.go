@@ -335,6 +335,53 @@ func (db *DB) View(fn func(txn *Txn) error) error {
 	return nil
 }
 
+// ViewAt performs a read-only transaction against the database as it existed at
+// timestamp, expressed in Unix nanoseconds. The timestamp boundary is inclusive:
+// versions written at exactly timestamp are visible.
+func (db *DB) ViewAt(timestamp int64, fn func(txn *Txn) error) error {
+	if db == nil {
+		return fmt.Errorf("database is nil")
+	}
+
+	txn, err := db.Begin()
+	if txn == nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	defer txn.remove()
+
+	txn.Timestamp = timestamp
+
+	return fn(txn)
+}
+
+// ViewAtTime is the time.Time form of ViewAt.
+func (db *DB) ViewAtTime(timestamp time.Time, fn func(txn *Txn) error) error {
+	return db.ViewAt(timestamp.UnixNano(), fn)
+}
+
+// GetAt retrieves a key as it existed at timestamp, expressed in Unix
+// nanoseconds. Versions newer than timestamp are ignored.
+func (db *DB) GetAt(key []byte, timestamp int64) ([]byte, error) {
+	var value []byte
+
+	err := db.ViewAt(timestamp, func(txn *Txn) error {
+		var err error
+		value, err = txn.Get(key)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return value, nil
+}
+
+// GetAtTime is the time.Time form of GetAt.
+func (db *DB) GetAtTime(key []byte, timestamp time.Time) ([]byte, error) {
+	return db.GetAt(key, timestamp.UnixNano())
+}
+
 // NewIterator creates a new bidirectional iterator
 func (txn *Txn) NewIterator(asc bool) (*MergeIterator, error) {
 	var items []*iterator
