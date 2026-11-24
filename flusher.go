@@ -3,6 +3,7 @@ package wildcat
 import (
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,6 +19,7 @@ type Flusher struct {
 	immutable    *queue.Queue             // Immutable queue for memtables
 	flushing     atomic.Pointer[Memtable] // Atomic pointer to the current flushing memtable
 	lastQueuedId int64                    // Last queued memtable id for the memtable
+	handoff      sync.RWMutex             // Serializes memtable handoff against in-flight commits
 }
 
 // newFlusher creates a new Flusher instance
@@ -28,8 +30,33 @@ func newFlusher(db *DB) *Flusher {
 	}
 }
 
+// beginWrite registers an in-flight commit and returns the memtable the commit
+// must write to. The returned memtable is stable for the whole commit: while
+// the caller holds the read lock, a handoff cannot retire that memtable, so the
+// skiplist and WAL writes always land in the same memtable.
+//
+// The read lock is uncontended on the write path (hand offs are rare and only
+// take the write lock briefly), so concurrent commits are not serialized and
+// their latency is unaffected.
+func (flusher *Flusher) beginWrite() *Memtable {
+	flusher.handoff.RLock()
+	return flusher.db.memtable.Load().(*Memtable)
+}
+
+// endWrite releases the commit registration acquired by beginWrite.
+func (flusher *Flusher) endWrite() {
+	flusher.handoff.RUnlock()
+}
+
 // queueMemtable queues the current active memtable for flushing to disk.
 func (flusher *Flusher) queueMemtable() error {
+	// Take the write side of the handoff lock so we wait for every commit that
+	// already resolved the active memtable to finish writing to it before the
+	// pointer is switched. New commits block only until the pointer store below
+	// completes (microseconds), then take the new memtable.
+	flusher.handoff.Lock()
+	defer flusher.handoff.Unlock()
+
 	currentMemtable := flusher.db.memtable.Load().(*Memtable)
 
 	if atomic.LoadInt64(&flusher.lastQueuedId) == currentMemtable.id {

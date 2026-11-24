@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"errors"
 	"math/rand"
+	"sync"
 	"sync/atomic"
 )
 
@@ -58,6 +59,7 @@ type SkipList struct {
 	header     *Node         // Special header node
 	level      atomic.Value  // Current maximum level of the list (atomic)
 	comparator KeyComparator // User-provided comparator function
+	structMu   sync.Mutex    // Serializes structural changes (node insertion and level growth)
 }
 
 // Iterator provides a bidirectional iterator for the skip list with snapshot isolation
@@ -262,119 +264,97 @@ func (sl *SkipList) Get(searchKey []byte, readTimestamp int64) ([]byte, int64, b
 
 // Put inserts or updates a value in the skip list with the given key
 func (sl *SkipList) Put(searchKey []byte, newValue []byte, writeTimestamp int64) {
-	var topLevel int
-	var existingNode *Node
+	// Fast path: the key already exists, so only a new MVCC version is appended.
+	// addVersion is lock-free, so updates to an existing key never take the
+	// structural lock and stay fully concurrent.
+	if existingNode := sl.findNode(searchKey); existingNode != nil {
+		existingNode.addVersion(newValue, writeTimestamp, Write)
+		return
+	}
 
-	for {
-		existingNode = nil
-		var update [MaxLevel]*Node
-		var prev *Node
-		var curr *Node
+	// Slow path: inserting a new node changes forward pointers across several
+	// levels. Those multi-level links are not atomic, so the whole structural
+	// change is serialized. Re-check for the node under the lock because another
+	// writer may have inserted it after the lock-free lookup above.
+	sl.structMu.Lock()
+	defer sl.structMu.Unlock()
 
-		prev = sl.header
-		currentLevel := sl.getLevel()
+	if existingNode := sl.findNode(searchKey); existingNode != nil {
+		existingNode.addVersion(newValue, writeTimestamp, Write)
+		return
+	}
 
-		// Navigate to insertion point
-		for i := currentLevel - 1; i >= 0; i-- {
-			curr = prev.forward[i].Load()
+	topLevel := sl.randomLevel()
+	currentLevel := sl.getLevel()
 
-			for curr != nil {
-				if sl.comparator(curr.key, searchKey) >= 0 {
-					break
-				}
-				prev = curr
-				curr = curr.forward[i].Load()
-			}
-			update[i] = prev
-		}
+	var update [MaxLevel]*Node
+	var prev *Node
+	var curr *Node
 
-		// Check for existing key at level 0
-		curr = prev.forward[0].Load()
-
+	prev = sl.header
+	// Navigate to the insertion point. Only structural writers mutate forward
+	// pointers and they hold structMu, so the recorded predecessors stay valid
+	// for the whole insertion.
+	for i := currentLevel - 1; i >= 0; i-- {
+		curr = prev.forward[i].Load()
 		for curr != nil {
-			cmp := sl.comparator(curr.key, searchKey)
-			if cmp == 0 {
-				existingNode = curr
-				break
-			}
-			if cmp > 0 {
+			if sl.comparator(curr.key, searchKey) >= 0 {
 				break
 			}
 			prev = curr
-			curr = curr.forward[0].Load()
-			update[0] = prev
+			curr = curr.forward[i].Load()
 		}
-
-		// If key exists, add new version atomically
-		if existingNode != nil {
-			existingNode.addVersion(newValue, writeTimestamp, Write)
-			return
-		}
-
-		// Generate random level once
-		if topLevel == 0 {
-			topLevel = sl.randomLevel()
-		}
-
-		// Update skip list level if necessary
-		if topLevel > currentLevel {
-			for i := currentLevel; i < topLevel; i++ {
-				update[i] = sl.header
-			}
-
-			// Atomic level update
-			sl.level.CompareAndSwap(currentLevel, topLevel)
-		}
-
-		// Create new node
-		keyClone := make([]byte, len(searchKey))
-		copy(keyClone, searchKey)
-
-		newNode := &Node{
-			key: keyClone,
-		}
-		newNode.addVersion(newValue, writeTimestamp, Write)
-
-		// Insert node at all levels atomically
-		insertSuccess := true
-		for i := 0; i < topLevel; i++ {
-			for {
-				next := update[i]
-				if next == nil {
-					insertSuccess = false
-					break
-				}
-
-				nextNode := next.forward[i].Load()
-
-				// Set new node's forward pointer
-				newNode.forward[i].Store(nextNode)
-
-				// Try to insert atomically
-				if next.forward[i].CompareAndSwap(nextNode, newNode) {
-					if i == 0 {
-						// Update backward pointer for level 0 atomically
-						if nextNode != nil {
-							nextNode.backward.Store(newNode)
-						}
-						newNode.backward.Store(next)
-					}
-					break
-				}
-				// CAS failed, need to retry entire operation
-				insertSuccess = false
-				break
-			}
-			if !insertSuccess {
-				break
-			}
-		}
-
-		if insertSuccess {
-			return
-		}
-		// Retry if insertion failed due to concurrent modifications
+		update[i] = prev
 	}
+
+	if topLevel > currentLevel {
+		for i := currentLevel; i < topLevel; i++ {
+			update[i] = sl.header
+		}
+		sl.level.Store(topLevel)
+	}
+
+	keyClone := make([]byte, len(searchKey))
+	copy(keyClone, searchKey)
+
+	newNode := &Node{
+		key: keyClone,
+	}
+	newNode.addVersion(newValue, writeTimestamp, Write)
+
+	// Link the node at every level bottom-up. Level 0 first so lock-free
+	// readers always observe a fully connected level-0 chain; the higher-level
+	// links only accelerate traversal.
+	for i := 0; i < topLevel; i++ {
+		nextNode := update[i].forward[i].Load()
+		newNode.forward[i].Store(nextNode)
+		update[i].forward[i].Store(newNode)
+		if i == 0 {
+			if nextNode != nil {
+				nextNode.backward.Store(newNode)
+			}
+			newNode.backward.Store(update[i])
+		}
+	}
+}
+
+// findNode returns the node for searchKey or nil if it is not present.
+// It relies only on atomic pointer loads and is safe for concurrent use.
+func (sl *SkipList) findNode(searchKey []byte) *Node {
+	prev := sl.header
+	curr := prev.forward[0].Load()
+	for curr != nil {
+		cmp := sl.comparator(curr.key, searchKey)
+		if cmp == 0 {
+			return curr
+		}
+		if cmp > 0 {
+			return nil
+		}
+		prev = curr
+		curr = curr.forward[0].Load()
+	}
+	return nil
 }
 
 // Delete adds a delete marker in the version chain at the given timestamp
@@ -382,106 +362,71 @@ func (sl *SkipList) Put(searchKey []byte, newValue []byte, writeTimestamp int64)
 // If the key does not exist in the skip list, a new node is created with
 // a delete marker to ensure the tombstone is persisted through flush to SSTable.
 func (sl *SkipList) Delete(searchKey []byte, deleteTimestamp int64) bool {
-	topLevel := 0
+	// Fast path: the node already exists, append a tombstone version without
+	// taking the structural lock.
+	if existingNode := sl.findNode(searchKey); existingNode != nil {
+		existingNode.addVersion(nil, deleteTimestamp, Delete)
+		return true
+	}
 
-	for {
-		var existingNode *Node
-		var update [MaxLevel]*Node
-		var prev *Node
-		var curr *Node
+	sl.structMu.Lock()
+	defer sl.structMu.Unlock()
 
-		prev = sl.header
-		currentLevel := sl.getLevel()
+	if existingNode := sl.findNode(searchKey); existingNode != nil {
+		existingNode.addVersion(nil, deleteTimestamp, Delete)
+		return true
+	}
 
-		// Navigate to the target position
-		for i := currentLevel - 1; i >= 0; i-- {
-			curr = prev.forward[i].Load()
-			for curr != nil {
-				if sl.comparator(curr.key, searchKey) >= 0 {
-					break
-				}
-				prev = curr
-				curr = curr.forward[i].Load()
-			}
-			update[i] = prev
-		}
+	// Key not found — insert a new node carrying a Delete version.
+	// This is essential for keys previously flushed to SSTables: without a
+	// tombstone in the memtable, the delete would be lost on flush.
+	topLevel := sl.randomLevel()
+	currentLevel := sl.getLevel()
 
-		// Check for existing key at level 0
-		curr = prev.forward[0].Load()
+	var update [MaxLevel]*Node
+	prev := sl.header
+	var curr *Node
+
+	for i := currentLevel - 1; i >= 0; i-- {
+		curr = prev.forward[i].Load()
 		for curr != nil {
-			cmp := sl.comparator(curr.key, searchKey)
-			if cmp == 0 {
-				existingNode = curr
-				break
-			}
-			if cmp > 0 {
+			if sl.comparator(curr.key, searchKey) >= 0 {
 				break
 			}
 			prev = curr
-			curr = curr.forward[0].Load()
-			update[0] = prev
+			curr = curr.forward[i].Load()
 		}
-
-		// If key exists, add delete version to existing node
-		if existingNode != nil {
-			existingNode.addVersion(nil, deleteTimestamp, Delete)
-			return true
-		}
-
-		// Key not found — insert a new node with a Delete version.
-		// This is essential for keys previously flushed to SSTables:
-		// without a tombstone in the memtable, the delete would be lost on flush.
-		if topLevel == 0 {
-			topLevel = sl.randomLevel()
-		}
-
-		if topLevel > currentLevel {
-			for i := currentLevel; i < topLevel; i++ {
-				update[i] = sl.header
-			}
-			sl.level.CompareAndSwap(currentLevel, topLevel)
-		}
-
-		keyClone := make([]byte, len(searchKey))
-		copy(keyClone, searchKey)
-
-		newNode := &Node{
-			key: keyClone,
-		}
-		newNode.addVersion(nil, deleteTimestamp, Delete)
-
-		insertSuccess := true
-		for i := 0; i < topLevel; i++ {
-			for {
-				next := update[i]
-				if next == nil {
-					insertSuccess = false
-					break
-				}
-				nextNode := next.forward[i].Load()
-				newNode.forward[i].Store(nextNode)
-				if next.forward[i].CompareAndSwap(nextNode, newNode) {
-					if i == 0 {
-						if nextNode != nil {
-							nextNode.backward.Store(newNode)
-						}
-						newNode.backward.Store(next)
-					}
-					break
-				}
-				insertSuccess = false
-				break
-			}
-			if !insertSuccess {
-				break
-			}
-		}
-
-		if insertSuccess {
-			return true
-		}
-		// Retry if insertion failed due to concurrent modifications
+		update[i] = prev
 	}
+
+	if topLevel > currentLevel {
+		for i := currentLevel; i < topLevel; i++ {
+			update[i] = sl.header
+		}
+		sl.level.Store(topLevel)
+	}
+
+	keyClone := make([]byte, len(searchKey))
+	copy(keyClone, searchKey)
+
+	newNode := &Node{
+		key: keyClone,
+	}
+	newNode.addVersion(nil, deleteTimestamp, Delete)
+
+	for i := 0; i < topLevel; i++ {
+		nextNode := update[i].forward[i].Load()
+		newNode.forward[i].Store(nextNode)
+		update[i].forward[i].Store(newNode)
+		if i == 0 {
+			if nextNode != nil {
+				nextNode.backward.Store(newNode)
+			}
+			newNode.backward.Store(update[i])
+		}
+	}
+
+	return true
 }
 
 // NewIterator creates a new iterator starting at the given key

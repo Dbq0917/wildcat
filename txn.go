@@ -136,7 +136,7 @@ func (txn *Txn) Delete(key []byte) error {
 }
 
 // Commit commits the transaction
-func (txn *Txn) Commit() error {
+func (txn *Txn) Commit() (err error) {
 	if txn == nil {
 		return fmt.Errorf("transaction is nil")
 	}
@@ -149,29 +149,46 @@ func (txn *Txn) Commit() error {
 		return nil // Already committed
 	}
 
+	// Hold the handoff read lock for the whole commit so the active memtable
+	// cannot be retired while we are writing into it. The pointer is resolved
+	// once and reused: the skiplist entries, size accounting and the commit WAL
+	// record all land in this same memtable. A concurrent handoff only waits for
+	// this to finish instead of racing the pointer switch.
+	memtable := txn.db.flusher.beginWrite()
+	var queueMemtable bool
+	var queueErr error
+	defer func() {
+		// Release the handoff read lock before taking the write lock in
+		// queueMemtable to avoid a self-deadlock; no memtable access remains.
+		txn.db.flusher.endWrite()
+		if queueMemtable {
+			queueErr = txn.db.flusher.queueMemtable()
+			if queueErr != nil && err == nil {
+				err = fmt.Errorf("failed to queue memtable: %w", queueErr)
+			}
+		}
+	}()
+
 	for key, value := range txn.WriteSet {
-		txn.db.memtable.Load().(*Memtable).skiplist.Put([]byte(key), value, txn.Timestamp)
-		atomic.AddInt64(&txn.db.memtable.Load().(*Memtable).size, int64(len(key)+len(value)))
+		memtable.skiplist.Put([]byte(key), value, txn.Timestamp)
+		atomic.AddInt64(&memtable.size, int64(len(key)+len(value)))
 	}
 
 	for key := range txn.DeleteSet {
-		txn.db.memtable.Load().(*Memtable).skiplist.Delete([]byte(key), txn.Timestamp)
-		atomic.AddInt64(&txn.db.memtable.Load().(*Memtable).size, -int64(len(key)))
+		memtable.skiplist.Delete([]byte(key), txn.Timestamp)
+		atomic.AddInt64(&memtable.size, -int64(len(key)))
 	}
 
 	txn.Committed = true
 
-	err := txn.appendWal()
+	err = txn.appendWalTo(memtable)
 	if err != nil {
 		return err
 	}
 
 	// Check if we need to enqueue the memtable for a sorted run to level 1
-	if atomic.LoadInt64(&txn.db.memtable.Load().(*Memtable).size) > txn.db.opts.WriteBufferSize {
-		err = txn.db.flusher.queueMemtable()
-		if err != nil {
-			return fmt.Errorf("failed to queue memtable: %w", err)
-		}
+	if atomic.LoadInt64(&memtable.size) > txn.db.opts.WriteBufferSize {
+		queueMemtable = true
 	}
 
 	return nil
@@ -628,6 +645,14 @@ func (txn *Txn) remove() {
 
 // appendWal appends the transaction state to a Write-Ahead Log (WAL)
 func (txn *Txn) appendWal() error {
+	return txn.appendWalTo(txn.db.memtable.Load().(*Memtable))
+}
+
+// appendWalTo appends the transaction state to the WAL paired with the given
+// memtable. Callers that already hold the handoff read lock (Commit) must pass
+// the memtable they resolved at lock acquisition so the WAL record cannot be
+// written to a different memtable than the in-memory writes.
+func (txn *Txn) appendWalTo(memtable *Memtable) error {
 	data, err := txn.serializeTransaction()
 	if err != nil {
 		return fmt.Errorf("failed to serialize transaction: %w", err)
@@ -636,7 +661,7 @@ func (txn *Txn) appendWal() error {
 	var lastErr error
 	for attempt := 0; attempt <= txn.db.opts.WalAppendRetry; attempt++ {
 
-		walPath := txn.db.memtable.Load().(*Memtable).wal.path
+		walPath := memtable.wal.path
 		wal, ok := txn.db.lru.Get(walPath)
 		if !ok {
 

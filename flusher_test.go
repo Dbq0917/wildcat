@@ -1697,3 +1697,162 @@ func TestFlusher_TempFileHandling(t *testing.T) {
 		t.Logf("Correctly created %d final files after temp file cleanup", finalFileCount)
 	}
 }
+
+// TestFlusher_ConcurrentWritesAtSwitch hammers commits from multiple goroutines
+// while memtables are repeatedly handed off. Every successfully committed key
+// must be readable afterwards and survive a reopen: without a handoff barrier a
+// commit can keep writing into the retired memtable after the pointer switch,
+// landing neither in the new memtable nor in the flushed SSTable/WAL.
+func TestFlusher_ConcurrentWritesAtSwitch(t *testing.T) {
+	dir, err := os.MkdirTemp("", "db_flusher_switch_race")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(dir)
+	}()
+
+	logChan := make(chan string, 1000)
+	go func() {
+		for range logChan {
+		}
+	}()
+
+	opts := &Options{
+		Directory:       dir,
+		WriteBufferSize: 1024 * 1024,
+		SyncOption:      SyncNone,
+		LogChannel:      logChan,
+	}
+
+	db, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	const writers = 8
+	const keysPerWriter = 250
+	const switchCount = 40
+
+	var (
+		wg            sync.WaitGroup
+		committedKeys sync.Map
+		commitErrors  atomic.Int32
+		start         = make(chan struct{})
+	)
+
+	// Writers keep committing unique keys throughout the handoff window.
+	for writer := 0; writer < writers; writer++ {
+		wg.Add(1)
+		go func(writer int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < keysPerWriter; i++ {
+				key := []byte(fmt.Sprintf("switch_key_%d_%d", writer, i))
+				value := []byte(fmt.Sprintf("switch_value_%d_%d", writer, i))
+				if commitErr := db.Update(func(txn *Txn) error {
+					return txn.Put(key, value)
+				}); commitErr != nil {
+					commitErrors.Add(1)
+					continue
+				}
+				committedKeys.Store(string(key), string(value))
+				var immediate []byte
+				if readErr := db.View(func(txn *Txn) error {
+					var readErr error
+					immediate, readErr = txn.Get(key)
+					return readErr
+				}); readErr != nil || string(immediate) != string(value) {
+					t.Errorf("immediate read after commit failed for %s: readErr=%v got=%q", key, readErr, string(immediate))
+					return
+				}
+			}
+		}(writer)
+	}
+
+	// Switcher repeatedly forces handoffs so commits race the pointer switch.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < switchCount; i++ {
+			if switchErr := db.flusher.queueMemtable(); switchErr != nil {
+				t.Errorf("queueMemtable failed on switch %d: %v", i, switchErr)
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+
+	if commitErrors.Load() > 0 {
+		t.Fatalf("encountered %d commit errors during concurrent switch", commitErrors.Load())
+	}
+
+	// Every committed key must still be readable on the live instance, regardless
+	// of which memtable it landed in.
+	var missingLive []string
+	committedKeys.Range(func(key, value any) bool {
+		var actual []byte
+		if getErr := db.View(func(txn *Txn) error {
+			var getErr error
+			actual, getErr = txn.Get([]byte(key.(string)))
+			return getErr
+		}); getErr != nil || string(actual) != value.(string) {
+			missingLive = append(missingLive, key.(string))
+		}
+		return true
+	})
+
+	if len(missingLive) > 0 {
+		t.Fatalf("%d committed keys missing before reopen, sample: %v",
+			len(missingLive), missingLive[:min(10, len(missingLive))])
+	}
+
+	// Flush everything so WAL replay is not masking a lost in-memory write, then
+	// reopen and verify the same keys survived the round trip.
+	if err = db.ForceFlush(); err != nil {
+		_ = db.Close()
+		t.Fatalf("ForceFlush failed: %v", err)
+	}
+
+	if err = db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := Open(&Options{
+		Directory:       dir,
+		WriteBufferSize: 1024 * 1024,
+		SyncOption:      SyncNone,
+		LogChannel:      make(chan string, 1000),
+	})
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer func() {
+		_ = reopened.Close()
+	}()
+
+	var missingAfterReopen []string
+	committedKeys.Range(func(key, value any) bool {
+		var actual []byte
+		if getErr := reopened.View(func(txn *Txn) error {
+			var getErr error
+			actual, getErr = txn.Get([]byte(key.(string)))
+			return getErr
+		}); getErr != nil || string(actual) != value.(string) {
+			missingAfterReopen = append(missingAfterReopen, key.(string))
+		}
+		return true
+	})
+
+	if len(missingAfterReopen) > 0 {
+		t.Fatalf("%d committed keys lost after reopen, sample: %v",
+			len(missingAfterReopen), missingAfterReopen[:min(10, len(missingAfterReopen))])
+	}
+
+	t.Logf("Verified all %d committed keys survived %d concurrent memtable switches and a reopen",
+		writers*keysPerWriter, switchCount)
+}
