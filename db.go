@@ -56,18 +56,19 @@ const (
 
 // Internal constants used across the codebase to avoid magic numbers
 const (
-	FarFutureOffsetNs              = 10_000_000_000 // 10 seconds in nanoseconds; added to time.Now().UnixNano() to scan all versions
-	TombstoneBlockID         int64 = -1             // Sentinel ValueBlockID indicating a deletion marker in KLogEntry
-	FlushTargetLevel               = 1              // Memtables are always flushed to level 1 (L0 is the active memtable)
-	CompactionScoreThreshold       = 1.0            // Compaction score above which a level triggers compaction
-	PartitioningJobPriority        = 10.0           // Highest priority value for last-level partitioning jobs
-	MinSSTablesToCompact           = 2              // Minimum number of SSTables required to perform a compaction
-	SizeTieredMaxLevelIdx          = 2              // Levels with index < this use size-tiered compaction; others use leveled
-	MinLevelsForPartitioning       = 2              // Minimum last-level index required before partitioning is considered
-	MinBTreeOrder                  = 2              // Minimum allowed B-tree order for SSTables
-	BytesPerMB                     = 1024 * 1024    // Bytes in a megabyte, used for human-readable log output
-	JitterFraction                 = 4              // Divides backoff to produce ±25% jitter
-	JitterCoinFlip                 = 2              // Used with rand.Intn for 50/50 jitter direction
+	FarFutureOffsetNs                   = 10_000_000_000 // 10 seconds in nanoseconds; added to time.Now().UnixNano() to scan all versions
+	TombstoneBlockID              int64 = -1             // Sentinel ValueBlockID indicating a deletion marker in KLogEntry
+	FlushTargetLevel                    = 1              // Memtables are always flushed to level 1 (L0 is the active memtable)
+	CompactionScoreThreshold            = 1.0            // Compaction score above which a level triggers compaction
+	PartitioningJobPriority             = 10.0           // Highest priority value for last-level partitioning jobs
+	MinSSTablesToCompact                = 2              // Minimum number of SSTables required to perform a compaction
+	SizeTieredMaxLevelIdx               = 2              // Levels with index < this use size-tiered compaction; others use leveled
+	MinLevelsForPartitioning            = 2              // Minimum last-level index required before partitioning is considered
+	MinBTreeOrder                       = 2              // Minimum allowed B-tree order for SSTables
+	BytesPerMB                          = 1024 * 1024    // Bytes in a megabyte, used for human-readable log output
+	JitterFraction                      = 4              // Divides backoff to produce ±25% jitter
+	JitterCoinFlip                      = 2              // Used with rand.Intn for 50/50 jitter direction
+	CompactionCancelCheckInterval       = 1024           // Merge iterations between cooperative shutdown checks
 )
 
 // Defaults
@@ -91,6 +92,7 @@ const (
 	DefaultCompactionActiveSSTReadWaitBackoff   = 8 * time.Microsecond // Backoff is used to avoid busy waiting when checking if sstables are safe to remove during compaction process final steps
 	DefaultFlusherTickerInterval                = 1 * time.Millisecond
 	DefaultCompactorTickerInterval              = 250 * time.Millisecond // Default interval for compactor ticker
+	DefaultCloseTimeout                         = 30 * time.Second       // Default maximum time Close waits for background flushes and compactions to finish
 	DefaultBloomFilterFPR                       = 0.01                   // Default false positive rate for Bloom filter
 	DefaultWALAppendRetry                       = 10                     // Default number of retries for WAL append
 	DefaultWALAppendBackoff                     = 128 * time.Microsecond // Default backoff duration for WAL append
@@ -129,6 +131,7 @@ type Options struct {
 	CompactionPartitionDistributionRatio float64       // How to split between L-1 and L-2 (0.7 = 70% to L-1, 30% to L-2)
 	CompactorTickerInterval              time.Duration // Interval for compactor ticker
 	FlusherTickerInterval                time.Duration // Interval for flusher ticker
+	CloseTimeout                         time.Duration // Maximum time Close waits for background work to finish; <= 0 uses DefaultCloseTimeout
 	BloomFilterFPR                       float64       // False positive rate for Bloom filter
 	WalAppendRetry                       int           // Number of retries for WAL append
 	WalAppendBackoff                     time.Duration // Backoff duration for WAL append
@@ -140,22 +143,46 @@ type Options struct {
 	RecoverUncommittedTxns               bool          // Whether to recover uncommitted transactions on startup
 }
 
+// ErrCloseTimeout is returned when Close reaches the configured CloseTimeout before
+// background flushes and compactions have fully stopped. The database is still shutting
+// down: no new work is scheduled and in-flight writes keep their WAL entries, so a
+// later reopen replays them instead of losing data.
+var ErrCloseTimeout = errors.New("database close timed out waiting for background operations to finish")
+
 // DB represents the main Wildcat structure
 type DB struct {
-	opts           *Options                 // Configuration options for db instance
-	txnBuffer      *buffer.Buffer           // Atomic buffer for transactions
-	levels         atomic.Pointer[[]*Level] // Atomic pointer to the levels
-	lru            *lru.LRU                 // LRU cache for block managers
-	flusher        *Flusher                 // Flusher queues memtables and flushes them to disk to level 1
-	compactor      *Compactor               // Compactor for compacting levels
-	memtable       atomic.Value             // The current memtable
-	wg             *sync.WaitGroup          // WaitGroup for synchronization
-	closeCh        chan struct{}            // Channel for closing up
-	sstIdGenerator *IDGenerator             // ID generator for SSTables
-	walIdGenerator *IDGenerator             // ID generator for WAL files
-	txnTSGenerator *IDGenerator             // Generator for transaction timestamps
-	logChannel     chan string              // Log channel, instead of log file or standard output we log to a channel
-	idgs           *IDGeneratorState        // ID state for sstable, wal, and txn timestamps
+	opts            *Options                 // Configuration options for db instance
+	txnBuffer       *buffer.Buffer           // Atomic buffer for transactions
+	levels          atomic.Pointer[[]*Level] // Atomic pointer to the levels
+	lru             *lru.LRU                 // LRU cache for block managers
+	flusher         *Flusher                 // Flusher queues memtables and flushes them to disk to level 1
+	compactor       *Compactor               // Compactor for compacting levels
+	memtable        atomic.Value             // The current memtable
+	closeCh         chan struct{}            // Channel for closing up
+	closeOnce       sync.Once                // Ensures closeCh is only closed once
+	closeMu         sync.Mutex               // Serializes Close calls while shutdown is in progress
+	closed          bool                     // Whether Close has been invoked
+	closeDeadlineCh chan struct{}            // Closed when the Close grace period expires
+	deadlineOnce    sync.Once                // Ensures the deadline channel is closed once
+	flusherWG       *sync.WaitGroup          // Tracks the flusher goroutine
+	compactorWG     *sync.WaitGroup          // Tracks the compactor goroutine and in-flight compaction jobs
+	sstIdGenerator  *IDGenerator             // ID generator for SSTables
+	walIdGenerator  *IDGenerator             // ID generator for WAL files
+	txnTSGenerator  *IDGenerator             // Generator for transaction timestamps
+	logChannel      chan string              // Log channel, instead of log file or standard output we log to a channel
+	idgs            *IDGeneratorState        // ID state for sstable, wal, and txn timestamps
+
+	// Test-only compaction gate, nil in production. When armed, compactSSTables
+	// blocks after reserving its input tables until the gate is released. Stored
+	// atomically so test setup is race-free against the background compactor.
+	testGate atomic.Pointer[compactionTestGate]
+}
+
+// compactionTestGate is a test-only synchronization point inside compactSSTables.
+type compactionTestGate struct {
+	gate        chan struct{} // Closed to release the blocked compaction
+	entered     chan struct{} // Closed once when a compaction reaches the gate
+	enteredOnce sync.Once
 }
 
 // IDGeneratorState represents the state of the ID generator.
@@ -191,12 +218,14 @@ func Open(opts *Options) (*DB, error) {
 	}
 
 	db := &DB{
-		lru:            lru.New(opts.BlockManagerLRUSize), // New block manager LRU cache
-		wg:             &sync.WaitGroup{},                 // Wait group for background operations
-		opts:           opts,                              // Set the options
-		txnBuffer:      buff,                              // Create a new buffer for transactions with the specified cap
-		closeCh:        make(chan struct{}),               // Channel for closing the database
-		txnTSGenerator: newIDGeneratorWithTimestamp(),     // We use timestamp generator for monotonic generation (1579134612000000004, next ID will be 1579134612000000005)
+		lru:             lru.New(opts.BlockManagerLRUSize), // New block manager LRU cache
+		flusherWG:       &sync.WaitGroup{},                 // Tracks the flusher goroutine
+		compactorWG:     &sync.WaitGroup{},                 // Tracks the compactor goroutine and jobs
+		opts:            opts,                              // Set the options
+		txnBuffer:       buff,                              // Create a new buffer for transactions with the specified cap
+		closeCh:         make(chan struct{}),               // Channel for closing the database
+		closeDeadlineCh: make(chan struct{}),               // Signals the end of the Close grace period
+		txnTSGenerator:  newIDGeneratorWithTimestamp(),     // We use timestamp generator for monotonic generation (1579134612000000004, next ID will be 1579134612000000005)
 	}
 
 	// Initialize flusher and compactor
@@ -284,11 +313,11 @@ func Open(opts *Options) (*DB, error) {
 	}
 
 	// Start the background flusher
-	db.wg.Add(1)
+	db.flusherWG.Add(1)
 	go db.flusher.backgroundProcess()
 
 	// Start the background compactor
-	db.wg.Add(1)
+	db.compactorWG.Add(1)
 	go db.compactor.backgroundProcess()
 
 	return db, nil
@@ -357,6 +386,10 @@ func (opts *Options) setDefaults() error {
 		opts.CompactorTickerInterval = DefaultCompactorTickerInterval
 	}
 
+	if opts.CloseTimeout <= 0 {
+		opts.CloseTimeout = DefaultCloseTimeout
+	}
+
 	if opts.BloomFilterFPR <= 0 {
 		opts.BloomFilterFPR = DefaultBloomFilterFPR
 	}
@@ -419,25 +452,106 @@ func (opts *Options) setDefaults() error {
 
 }
 
-// Close closes the database and all open resources
+// Close closes the database and all open resources.
+//
+// Shutdown is bounded by opts.CloseTimeout (see CloseWithTimeout for details).
 func (db *DB) Close() error {
 	if db == nil {
 		return errors.New("database is nil")
 	}
 
-	db.log("Closing database...")
+	return db.CloseWithTimeout(db.opts.CloseTimeout)
+}
 
-	// Send signal to close the database
-	select {
-	case <-db.closeCh:
-		// Channel is already closed, do nothing
-	default:
-		// Close the channel to stop background sync
-		close(db.closeCh)
+// CloseWithTimeout closes the database, waiting at most timeout for background
+// flushes and compactions to finish. A timeout <= 0 falls back to opts.CloseTimeout.
+//
+// The shutdown sequence never discards in-flight writes:
+//   - The flusher stops picking up new memtables, drains the memtables already queued
+//     and finishes the one currently being written within the deadline.
+//   - The compactor stops scheduling new jobs and running compactions abort
+//     cooperatively at safe checkpoints, leaving only .tmp files behind (the
+//     original SSTables and WAL entries stay intact; .tmp files are cleaned up
+//     on the next Open).
+//   - If the deadline expires first, ErrCloseTimeout is returned while the
+//     remaining background work keeps winding down. WAL entries for committed
+//     data still exist, so the next Open replays them rather than losing writes.
+func (db *DB) CloseWithTimeout(timeout time.Duration) error {
+	if db == nil {
+		return errors.New("database is nil")
 	}
-	db.wg.Wait()
 
-	// Close open block managers
+	if timeout <= 0 {
+		timeout = db.opts.CloseTimeout
+	}
+
+	db.closeMu.Lock()
+	if db.closed {
+		db.closeMu.Unlock()
+		return nil
+	}
+	db.closed = true
+	db.closeMu.Unlock()
+
+	db.log(fmt.Sprintf("Closing database (grace period %s)...", timeout))
+
+	// Signal background loops to stop and cancel long-running jobs cooperatively.
+	db.closeOnce.Do(func() {
+		close(db.closeCh)
+	})
+
+	// Wait for the flusher and compactor (including in-flight jobs) up to the deadline.
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	workersDone := make(chan struct{})
+	go func() {
+		db.flusherWG.Wait()
+		db.compactorWG.Wait()
+		close(workersDone)
+	}()
+
+	var closeErr error
+	select {
+	case <-workersDone:
+		db.log("Background flusher and compactor stopped cleanly.")
+	case <-timer.C:
+		closeErr = fmt.Errorf("%w after %s", ErrCloseTimeout, timeout)
+		// Tell still-running workers the grace period is over so they stop draining.
+		db.deadlineOnce.Do(func() { close(db.closeDeadlineCh) })
+		db.log(fmt.Sprintf("Close timed out after %s; background work is still winding down.", timeout))
+	}
+
+	// On a clean stop it is safe to finalize resources immediately. On timeout the
+	// workers may still be writing (e.g. finishing a queued flush); finalize in the
+	// background once they exit so in-flight writes are never cut off mid-file.
+	if closeErr == nil {
+		db.finalizeClose()
+		return nil
+	}
+
+	go func() {
+		db.flusherWG.Wait()
+		db.compactorWG.Wait()
+		db.finalizeClose()
+	}()
+
+	return closeErr
+}
+
+// closeDeadlineExceeded reports whether the Close grace period has elapsed.
+func (db *DB) closeDeadlineExceeded() bool {
+	select {
+	case <-db.closeDeadlineCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// finalizeClose closes cached block managers and persists the ID generator state.
+// It must only run after every background goroutine has stopped touching files.
+func (db *DB) finalizeClose() {
 	db.lru.ForEach(func(key string, value interface{}) bool {
 		if bm, ok := value.(*blockmanager.BlockManager); ok {
 			_ = bm.Close()
@@ -445,9 +559,8 @@ func (db *DB) Close() error {
 		return true
 	})
 
-	// Save the ID generator state to disk
 	if err := db.idgs.saveState(); err != nil {
-		return fmt.Errorf("failed to save ID generator state: %w", err)
+		db.log(fmt.Sprintf("Failed to save ID generator state during shutdown: %v", err))
 	}
 
 	db.log("Database closed successfully.")
@@ -455,8 +568,6 @@ func (db *DB) Close() error {
 	if db.opts.LogChannel != nil {
 		close(db.opts.LogChannel)
 	}
-
-	return nil
 }
 
 // reinstate reopens the WAL files and replays them to restore the state of the database

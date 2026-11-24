@@ -424,6 +424,30 @@ wg.Wait() // Wait for the goroutine to finish
 defer db.Close()
 ```
 
+### Graceful Shutdown
+`Close` is bounded by the `CloseTimeout` option, so a long-running compaction can no
+longer make the process hang indefinitely during deployment. On shutdown:
+
+- The flusher drains memtables already queued and finishes the one in progress.
+- The compactor stops scheduling new jobs and in-flight compactions abort
+  cooperatively at safe checkpoints, leaving only `.tmp` output files (cleaned up
+  automatically on the next open); the original SSTables are never touched.
+- Committed data is never discarded: anything not flushed keeps its WAL entry and
+  is replayed on the next open.
+
+If background work does not finish within the grace period, `Close` returns
+`ErrCloseTimeout` while the remaining work keeps winding down in the background:
+
+```go
+if err := db.CloseWithTimeout(10 * time.Second); err != nil {
+    if errors.Is(err, wildcat.ErrCloseTimeout) {
+        log.Println("shutdown grace period elapsed; WAL will be replayed on next open")
+    } else {
+        log.Fatalf("close failed: %v", err)
+    }
+}
+```
+
 ### Database Statistics
 Wildcat provides comprehensive statistics about database state
 ```go
@@ -533,6 +557,7 @@ Wildcat provides many configuration options for fine-tuning.
 | **CompactionPartitionDistributionRatio** | `0.7` | How to split between L-1 and L-2 (0.7 = 70% to L-1, 30% to L-2) |
 | **FlusherTickerInterval** | `1 * time.Millisecond` | Interval for flusher background process |
 | **CompactorTickerInterval** | `250 * time.Millisecond` | Interval for compactor background process |
+| **CloseTimeout** | `30 * time.Second` | Maximum time `Close` waits for background flushes and compactions to finish. Use `CloseWithTimeout` to override per call; on timeout `ErrCloseTimeout` is returned and in-flight writes are preserved via their WAL for replay. |
 | **BloomFilterFPR** | `0.01` | False positive rate for Bloom filters |
 | **WalAppendRetry** | `10` | Number of retries for WAL append operations |
 | **WalAppendBackoff** | `128 * time.Microsecond` | Backoff duration for WAL append retries |

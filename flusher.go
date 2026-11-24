@@ -77,14 +77,19 @@ func (flusher *Flusher) queueMemtable() error {
 
 // backgroundProcess starts the background process for flushing memtables
 func (flusher *Flusher) backgroundProcess() {
-	defer flusher.db.wg.Done()
+	defer flusher.db.flusherWG.Done()
 	ticker := time.NewTicker(flusher.db.opts.FlusherTickerInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-flusher.db.closeCh:
-			flusher.db.log("Flusher: shutting down background process")
+			flusher.db.log("Flusher: shutting down background process, draining queued memtables")
+			// On shutdown we do not abandon queued memtables: drain them and finish the
+			// one already in progress so committed data reaches an SSTable (or, at worst,
+			// stays in its WAL for replay on the next open). The drain is bounded by the
+			// close deadline via the shutdown context.
+			flusher.drainOnShutdown()
 			return
 		case <-ticker.C:
 			immutableMemt := flusher.immutable.Dequeue()
@@ -92,17 +97,52 @@ func (flusher *Flusher) backgroundProcess() {
 				continue // No immutable memtable to flush
 			}
 
-			flusher.db.log(fmt.Sprintf("Flusher: flushing immutable memtable %s", immutableMemt.(*Memtable).wal.path))
+			flusher.flushQueued(immutableMemt.(*Memtable))
+		}
+	}
+}
 
-			// Set the flushing memtable
-			flusher.flushing.Store(immutableMemt.(*Memtable))
+// flushQueued marks the memtable as in progress and flushes it. On failure the
+// memtable is re-enqueued so its WAL is never silently dropped; the background
+// loop will retry while the database is open, and shutdown draining retries
+// until the close deadline expires (the WAL remains for replay).
+func (flusher *Flusher) flushQueued(memt *Memtable) {
+	flusher.db.log(fmt.Sprintf("Flusher: flushing immutable memtable %s", memt.wal.path))
 
-			// Flush the immutable memtable to disk
-			err := flusher.flushMemtable(immutableMemt.(*Memtable))
+	flusher.flushing.Store(memt)
 
-			if err != nil {
-				continue
-			}
+	if err := flusher.flushMemtable(memt); err != nil {
+		flusher.db.log(fmt.Sprintf("Flusher: failed to flush memtable %s, re-enqueuing: %v", memt.wal.path, err))
+		flusher.immutable.Enqueue(memt)
+	}
+}
+
+// drainOnShutdown flushes every memtable already queued, bounded by the shutdown
+// context. Memtables that cannot be flushed before the deadline keep their WAL
+// files and are replayed on the next open.
+func (flusher *Flusher) drainOnShutdown() {
+	for {
+		// Stop draining once the close deadline is reached; remaining WALs are
+		// replayed on the next open instead of being abandoned.
+		if flusher.db.closeDeadlineExceeded() {
+			flusher.db.log("Flusher: close deadline exceeded, leaving remaining memtables to WAL replay")
+			return
+		}
+
+		immutableMemt := flusher.immutable.Dequeue()
+		if immutableMemt == nil {
+			return
+		}
+
+		memt := immutableMemt.(*Memtable)
+		flusher.flushQueued(memt)
+
+		// A failed flush re-enqueues the memtable for retry. Back off briefly to
+		// avoid busy-spinning on a persistent error until the deadline expires.
+		select {
+		case <-flusher.db.closeDeadlineCh:
+			return
+		case <-time.After(flusher.db.opts.FlusherTickerInterval):
 		}
 	}
 }

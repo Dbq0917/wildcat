@@ -33,7 +33,13 @@ type Compactor struct {
 	maxConcurrency  int             // Maximum number of concurrent compactions
 	lastCompaction  time.Time       // Timestamp of the last compaction
 	scoreLock       sync.Mutex      // Mutex for synchronizing compaction score calculations
+	jobWG           sync.WaitGroup  // Tracks in-flight compaction jobs so Close can wait for them
 }
+
+// errCompactionCanceled is returned when a compaction is aborted cooperatively
+// during database shutdown. Any files it created use the .tmp extension and are
+// removed on failure / cleaned up on the next open; the input SSTables are untouched.
+var errCompactionCanceled = errors.New("compaction canceled during database shutdown")
 
 // iterState holds the state of an iterator for compaction
 type iterState struct {
@@ -58,7 +64,7 @@ func newCompactor(db *DB) *Compactor {
 
 // backgroundProcess runs the compaction process in the background
 func (compactor *Compactor) backgroundProcess() {
-	defer compactor.db.wg.Done()
+	defer compactor.db.compactorWG.Done()
 	ticker := time.NewTicker(compactor.db.opts.CompactorTickerInterval)
 	defer ticker.Stop()
 
@@ -66,6 +72,7 @@ func (compactor *Compactor) backgroundProcess() {
 		select {
 		case <-compactor.db.closeCh:
 			compactor.db.log("Compactor: shutting down background process")
+			compactor.jobWG.Wait()
 			return
 		case <-ticker.C:
 			// Check and schedule compactions
@@ -394,6 +401,11 @@ func (compactor *Compactor) compactSSTables(sstables []*SSTable, sourceLevelIdx,
 		return nil
 	}
 
+	// Track every compaction (including ones started directly, outside the
+	// scheduler) so Close waits for in-flight work up to its deadline.
+	compactor.jobWG.Add(1)
+	defer compactor.jobWG.Done()
+
 	sourceLevelNum := indexToLevel(sourceLevelIdx)
 	targetLevelNum := indexToLevel(targetLevelIdx)
 
@@ -405,6 +417,11 @@ func (compactor *Compactor) compactSSTables(sstables []*SSTable, sourceLevelIdx,
 		if atomic.LoadInt32(&table.isMerging) != 1 {
 			return fmt.Errorf("SSTable %d is not properly reserved for merging", table.Id)
 		}
+	}
+
+	// Do not start a new compaction if shutdown has already begun.
+	if err := compactor.shutdownErr(); err != nil {
+		return err
 	}
 
 	// Create a new SSTable for the target level
@@ -465,18 +482,36 @@ func (compactor *Compactor) compactSSTables(sstables []*SSTable, sourceLevelIdx,
 	dropTombstones := compactor.canDropTombstones(sstables)
 	compactor.db.log(fmt.Sprintf("Compaction dropTombstones=%v for %d SSTables", dropTombstones, len(sstables)))
 
+	// Test-only gate: hold the compaction mid-flight so shutdown can race it.
+	if gate := compactor.db.testGate.Load(); gate != nil {
+		gate.enteredOnce.Do(func() { close(gate.entered) })
+		<-gate.gate
+	}
+
 	// Merge the SSTables
 	err = compactor.mergeSSTables(sstables, klogBm, vlogBm, newSSTable, dropTombstones)
 	if err != nil {
-		_ = os.Remove(klogTmpPath)
-		_ = os.Remove(vlogTmpPath)
+		cleanupTempFiles(klogTmpPath, vlogTmpPath)
 		return fmt.Errorf("failed to merge SSTables: %w", err)
 	}
 
 	compactor.db.log(fmt.Sprintf("Merged %d SSTables into new SSTable %d", len(sstables), newSSTable.Id))
 
+	// Abort before mutating any level state or deleting input SSTables. At this
+	// point only .tmp output files exist; the original SSTables remain fully intact.
+	if err := compactor.shutdownErr(); err != nil {
+		cleanupTempFiles(klogTmpPath, vlogTmpPath)
+		return err
+	}
+
 	// Wait for any active reads to merged sstables to complete before updating the level
 	compactor.waitForActiveReads(sstables)
+
+	// Re-check after waiting: never commit a compaction while the database is closing.
+	if err := compactor.shutdownErr(); err != nil {
+		cleanupTempFiles(klogTmpPath, vlogTmpPath)
+		return err
+	}
 
 	// Add the new SSTable to the target level
 	targetLevelPtr := (*compactor.db.levels.Load())[targetLevelIdx]
@@ -694,8 +729,18 @@ func (compactor *Compactor) mergeSSTables(sstables []*SSTable, klogBm, vlogBm *b
 	var entryCount int64
 	var totalSize int64
 	var entries []tree.KeyValue // collect for bulk load (merge output is sorted by key)
+	var iterCount int64
 
 	for {
+		// Cooperative shutdown checkpoint: check periodically rather than per entry
+		// to keep merge overhead negligible while still bounding shutdown latency.
+		iterCount++
+		if iterCount%CompactionCancelCheckInterval == 0 {
+			if err := compactor.shutdownErr(); err != nil {
+				return err
+			}
+		}
+
 		var minKey []byte
 		var candidates []*iterState
 
@@ -929,6 +974,14 @@ func (compactor *Compactor) partitionLastLevel(sstables []*SSTable, lastLevelIdx
 		return nil
 	}
 
+	compactor.jobWG.Add(1)
+	defer compactor.jobWG.Done()
+
+	// Do not start a partitioning job once shutdown has begun.
+	if err := compactor.shutdownErr(); err != nil {
+		return err
+	}
+
 	lastLevelNum := indexToLevel(lastLevelIdx)
 	compactor.db.log(fmt.Sprintf("Starting partitioning of %d SSTables from last level %d", len(sstables), lastLevelNum))
 
@@ -952,10 +1005,17 @@ func (compactor *Compactor) partitionLastLevel(sstables []*SSTable, lastLevelIdx
 
 	// Move SSTables to L-2 (two levels up)
 	if len(toLevel2) > 0 && lastLevelIdx >= 2 {
+		if err := compactor.shutdownErr(); err != nil {
+			return err
+		}
 		err := compactor.redistributeToLevel(toLevel2, lastLevelIdx-2)
 		if err != nil {
 			return fmt.Errorf("failed to redistribute SSTables to level %d: %w", lastLevelNum-2, err)
 		}
+	}
+
+	if err := compactor.shutdownErr(); err != nil {
+		return err
 	}
 
 	// Remove the original SSTables from the last level
@@ -1083,33 +1143,24 @@ func (compactor *Compactor) redistributeToLevel(tables []*SSTable, targetLevelId
 	}
 
 	// Create paths for the new SSTable
+	klogTmpPath := fmt.Sprintf("%s%s%d%s%s", targetPath, SSTablePrefix, newSSTable.Id, KLogExtension, TempFileExtension)
+	vlogTmpPath := fmt.Sprintf("%s%s%d%s%s", targetPath, SSTablePrefix, newSSTable.Id, VLogExtension, TempFileExtension)
 	klogPath := fmt.Sprintf("%s%s%d%s", targetPath, SSTablePrefix, newSSTable.Id, KLogExtension)
 	vlogPath := fmt.Sprintf("%s%s%d%s", targetPath, SSTablePrefix, newSSTable.Id, VLogExtension)
 
 	// Create block managers for new files
-	klogBm, err := blockmanager.Open(klogPath, os.O_RDWR|os.O_CREATE, compactor.db.opts.Permission,
+	klogBm, err := blockmanager.Open(klogTmpPath, os.O_RDWR|os.O_CREATE, compactor.db.opts.Permission,
 		blockmanager.SyncOption(compactor.db.opts.SyncOption), compactor.db.opts.SyncInterval)
 	if err != nil {
 		return fmt.Errorf("failed to create KLog: %w", err)
 	}
-	defer func(klogBm *blockmanager.BlockManager) {
-		err := klogBm.Close()
-		if err != nil {
-			compactor.db.log(fmt.Sprintf("Error closing KLog block manager: %v", err))
-		}
-	}(klogBm)
 
-	vlogBm, err := blockmanager.Open(vlogPath, os.O_RDWR|os.O_CREATE, compactor.db.opts.Permission,
+	vlogBm, err := blockmanager.Open(vlogTmpPath, os.O_RDWR|os.O_CREATE, compactor.db.opts.Permission,
 		blockmanager.SyncOption(compactor.db.opts.SyncOption), compactor.db.opts.SyncInterval)
 	if err != nil {
+		_ = klogBm.Close()
 		return fmt.Errorf("failed to create VLog: %w", err)
 	}
-	defer func(vlogBm *blockmanager.BlockManager) {
-		err := vlogBm.Close()
-		if err != nil {
-			compactor.db.log(fmt.Sprintf("Error closing VLog block manager: %v", err))
-		}
-	}(vlogBm)
 
 	// Determine if tombstones can be safely dropped
 	dropTombstones := compactor.canDropTombstones(tables)
@@ -1117,13 +1168,53 @@ func (compactor *Compactor) redistributeToLevel(tables []*SSTable, targetLevelId
 	// Merge the SSTables
 	err = compactor.mergeSSTables(tables, klogBm, vlogBm, newSSTable, dropTombstones)
 	if err != nil {
-		_ = os.Remove(klogPath)
-		_ = os.Remove(vlogPath)
+		abortTempOutput(klogBm, vlogBm, klogTmpPath, vlogTmpPath)
 		return fmt.Errorf("failed to merge SSTables: %w", err)
 	}
 
 	// Wait for any active reads to complete
 	compactor.waitForActiveReads(tables)
+
+	// Abort before publishing the new SSTable; the source tables are untouched
+	// and only .tmp outputs exist.
+	if err := compactor.shutdownErr(); err != nil {
+		abortTempOutput(klogBm, vlogBm, klogTmpPath, vlogTmpPath)
+		return err
+	}
+
+	// Finalize output atomically before it becomes visible in the level.
+	if err := klogBm.Close(); err != nil {
+		abortTempOutput(nil, vlogBm, klogTmpPath, vlogTmpPath)
+		return fmt.Errorf("failed to close KLog block manager: %w", err)
+	}
+
+	if err := vlogBm.Close(); err != nil {
+		cleanupTempFiles(klogTmpPath, vlogTmpPath)
+		return fmt.Errorf("failed to close VLog block manager: %w", err)
+	}
+
+	if err := os.Rename(klogTmpPath, klogPath); err != nil {
+		cleanupTempFiles(vlogTmpPath)
+		return fmt.Errorf("failed to rename KLog file: %w", err)
+	}
+
+	if err := os.Rename(vlogTmpPath, vlogPath); err != nil {
+		cleanupTempFiles(vlogTmpPath)
+		return fmt.Errorf("failed to rename VLog file: %w", err)
+	}
+
+	// Reopen the finalized files for the LRU cache.
+	klogBm, err = blockmanager.Open(klogPath, os.O_RDONLY, compactor.db.opts.Permission,
+		blockmanager.SyncOption(compactor.db.opts.SyncOption))
+	if err != nil {
+		return fmt.Errorf("failed to reopen KLog block manager: %w", err)
+	}
+
+	vlogBm, err = blockmanager.Open(vlogPath, os.O_RDONLY, compactor.db.opts.Permission,
+		blockmanager.SyncOption(compactor.db.opts.SyncOption))
+	if err != nil {
+		return fmt.Errorf("failed to reopen VLog block manager: %w", err)
+	}
 
 	// Add new SSTable to target level
 	targetLevel := (*levels)[targetLevelIdx]
@@ -1354,6 +1445,42 @@ func (compactor *Compactor) waitForActiveReads(sstables []*SSTable) {
 
 			time.Sleep(compactor.db.opts.CompactionActiveSSTReadWaitBackoff)
 		}
+	}
+}
+
+// shutdownErr returns errCompactionCanceled once database shutdown has started.
+// Compactions call this at safe checkpoints where only .tmp output files exist
+// and the input SSTables have not been modified or deleted.
+func (compactor *Compactor) shutdownErr() error {
+	select {
+	case <-compactor.db.closeCh:
+		return errCompactionCanceled
+	default:
+		return nil
+	}
+}
+
+// abortTempOutput closes the block managers backing a partial compaction output
+// and removes its .tmp files. Closing first matters on platforms that refuse to
+// remove open files. The output is always .tmp until the final rename, so this
+// leaves the on-disk state exactly as it was before the compaction.
+func abortTempOutput(klogBm, vlogBm *blockmanager.BlockManager, paths ...string) {
+	if klogBm != nil {
+		_ = klogBm.Close()
+	}
+	if vlogBm != nil {
+		_ = vlogBm.Close()
+	}
+	for _, path := range paths {
+		_ = os.Remove(path)
+	}
+}
+
+// cleanupTempFiles removes partially written compaction output files whose block
+// managers are managed by the caller (e.g. via defer).
+func cleanupTempFiles(paths ...string) {
+	for _, path := range paths {
+		_ = os.Remove(path)
 	}
 }
 
